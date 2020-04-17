@@ -1,0 +1,1271 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[360]:
+
+
+get_ipython().run_line_magic('matplotlib', 'inline')
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from bs4 import BeautifulSoup
+import requests
+import json
+import time
+import datetime
+import os
+import logging
+from poloniex import Poloniex
+
+
+# For rnnModel :-For base_model : sampleModel
+
+# In[361]:
+
+
+
+def raiseNotDefined():
+	raise NotImplementedError("Each Model must re-implement this method.")
+
+class Model(object):
+	def __init__(self):
+		raiseNotDefined()
+
+	# create feed dict (return it)
+	def create_feed_dict(self, inputs):
+		raiseNotDefined()
+
+	# define the variables (add it to self.placeholders)
+	def add_placeholders(self):
+		raiseNotDefined()
+
+	# add an action (add it to self)
+	def add_action(self):
+		raiseNotDefined()
+
+	# create loss from action (return it)
+	def add_loss(self, action):
+		raiseNotDefined()
+
+	# define how to train from loss (return it)
+	def add_train_op(self, loss):
+		raiseNotDefined()
+
+	# train the model with 1 iteration
+	# return action and loss
+	def train(self, inputs, sess):
+		raiseNotDefined()
+
+	# get the action of the next time step
+	# return action and loss
+	def get_action(self, inputs, sess):
+		raiseNotDefined()
+
+	# get model meta data
+	def get_model_info(self):
+		raiseNotDefined()
+
+	# build the computation graph (add them to self)
+	# called after initializing an instance of the object
+	def build(self):
+		self.add_placeholders()
+		self.add_action()
+		self.loss = self.add_loss(self.action)
+		self.train_op = self.add_train_op(self.loss)
+
+
+# For rnnModel:-For base_model : model_manger : portfolio_data
+
+# In[362]:
+
+
+class pf:
+    def get_max_shape(d):
+        max_shape = 0
+        for k in d:
+            if len(d[k]) > max_shape:
+                max_shape = len(d[k])
+                coin = k
+        return max_shape, coin
+
+
+    def returns_data_frame(historical_data, window, coins, return_type="close_rate"):
+    # TO-DO
+    # Add asserts for case invalid historical data format
+    # Check if window < trade_period
+        trade_period, coin = get_max_shape(historical_data)
+        df = pd.DataFrame(index=historical_data[coin][-window:].index, columns=[historical_data.keys()])
+
+        for token in historical_data.keys():
+            if return_type == "close_rate":
+                df[token] = historical_data[token][-window:].close / historical_data[token][-window:].close.shift(1) - 1
+            if return_type == "log":
+                df[token] = np.log(historical_data[token][-window:].close) - np.log(
+                    historical_data[token][-window:].close.shift(1))
+            if return_type == "open_close_rate":
+                df[token] = historical_data[token][-window:].close / historical_data[token][-window:].open
+
+        df.fillna(0, inplace=True)
+        return df[coins][1:]
+
+    def extendDim(arr):
+        newshape = tuple(list(arr.shape) + [1])
+        return np.reshape(arr, newshape)
+
+    def getInitialAllocation(D):
+        prevA = np.array([0.0 for _ in range(D + 1)])
+        prevA[-1] = 0.0
+        return pf.extendDim(prevA)
+
+# get accumulated return based on growth rates (a list of floats like 1.02)
+# e.g. [1.2, 1.0, 1.5] -> [1.2, 1.2, 1.8]
+    def getAccumulatedReturn(growthRates):
+        cur = growthRates[0]
+        out = [cur]
+        for i in range(1, len(growthRates)):
+            cur *= growthRates[i]
+            out.append(cur)
+        return out
+
+    def prod(arr):
+        p = 1.0
+        for ele in arr:
+            p *= ele
+        return p
+
+    def loss2mRatio(loss):
+        return 1.0 / (1.0 - loss)
+
+    def setupLogger(outPath):
+        #createPath
+        os.mkdir(outPath)
+
+	# get the output file name
+        logFileName = outPath + '/model_log.txt'
+
+	# create logger
+        logger = logging.getLogger('drl_in_pm')
+
+	# create formatter
+        formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+
+	# get the file handler
+        hdlr = logging.FileHandler(logFileName)
+        hdlr.setFormatter(formatter)
+
+	# get the stream handler for system stdout
+        sh = logging.StreamHandler()
+        sh.setFormatter(formatter)
+
+	# add the handlers
+        logger.addHandler(hdlr)
+        logger.addHandler(sh)
+
+	# set level to debug
+        logger.setLevel(logging.DEBUG)
+        return logger
+
+    def featureTensor(inputs, N, W, M, L):
+        lRMtx = np.empty((W - N, M, N, L))
+        for i in range(N,W):
+            lRMtx[i-N] = np.swapaxes(inputs[i - N: i],0,1)
+        return lRMtx
+
+    def logReturn(prices, W, D):
+        logReturnPrices = np.diff(np.log(np.transpose(prices)))
+        logReturnPrices = np.swapaxes(logReturnPrices, 0, 2)
+        return logReturnPrices
+
+    def getInputs(stockData, N):
+
+#    stockData (WxMxL)
+#    W - window periods
+#    M - numer of assets
+#    L - features space
+#    L == 1 - close data.
+#    N - states of N previous days
+    
+
+        W, M, L = stockData.shape
+        closePrice = stockData[:, :, 0].reshape(W, M, 1)
+        returnMatrix = pf.logReturn(closePrice, W, M)
+        prevReturnMatrix = returnMatrix[N - 1:-1, :]
+        nextReturnMatrix = returnMatrix[N:, :, :]
+        returnTensor = pf.featureTensor(stockData, N, W, M, L)
+        return returnTensor, prevReturnMatrix, nextReturnMatrix
+
+
+# For rnnModel:-For base_model : model_manger
+
+# In[363]:
+
+
+from __future__ import print_function
+class mm:
+
+
+
+    def calcProfit(action, returns, inBatch = False):
+        if not inBatch:
+            return mm.calcProfitNoBatch(action, returns)
+        else:
+            return mm.calcProfitBatch(action, returns)
+
+    def calcProfitNoBatch(action, returns):
+        profit = tf.reduce_sum(tf.multiply(action[:-1], returns))
+        return profit
+
+    def calcProfitBatch(action, returns):
+        profit = tf.reduce_sum(tf.multiply(action[:,:-1], returns), axis = 1)
+        return tf.reduce_sum(profit)
+
+
+# multiply a batch of matrix a tensor in the shape of [D, N, L]
+# with a transformation matrix [L, transformSize]
+# output a tensor of shape [D, N, transformSize]
+    def batchMatMul(a, b, D):
+        out = []
+        print("batchMatMul", a.shape)
+        for i in range(D):
+            out.append(tf.matmul(a[i], b))
+        return tf.stack(out)
+
+    def train1epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, B = None):
+        return mm.trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess)
+
+    def test1epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, B = None):
+        return mm.trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, training = False)
+
+
+    def trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, training=True):
+        totalIters = returnTensor.shape[0]
+        prevLoss = 0.0
+        D = len(prevReturnMatrix[0])
+        prevA = pf.getInitialAllocation(D)
+        allActions = []
+        allLosses = []
+
+        for t in range(totalIters-1):
+            mRatio = pf.loss2mRatio(prevLoss)
+            inputs = {
+                'X': returnTensor[t],
+                'prevReturn': prevReturnMatrix[t],
+                'nextReturn': nextReturnMatrix[t],
+                'prevA': prevA,
+                'mRatio': mRatio
+            }
+            if training:
+                curA, curLoss = curModel.train(inputs, sess)
+            else:
+                curA, curLoss = curModel.get_action(inputs, sess)
+            allActions.append(curA)
+            allLosses.append(curLoss)
+
+            prevLoss = curLoss
+            prevA = curA
+
+        totalLoss = sum(allLosses)
+        growthRates = map(lambda x: 1 - x, allLosses)
+
+        return allActions, growthRates
+
+    def getDecayingWeights(tensorList):
+        l = len(tensorList)
+        cur = 1.0
+        out = [cur]
+        total = cur
+
+	# create list
+        for i in range(1, len(tensorList)):
+            cur = cur * np.exp(1.0)
+            out.append(cur)
+            total += cur
+
+	# normalize
+        out = [ele/total for ele in out]
+
+	# convert to tensor
+        out = [tf.constant(ele, dtype = tf.float32) for ele in out]
+        return out
+
+    def calcTransCost(action, prevAction, prevLogR, transCostParams, mRatio, inBatch = False):
+        if not inBatch:
+            return mm.calcTransCostNoBatch(action, prevAction, prevLogR, transCostParams, mRatio)
+        else:
+            return mm.calcTransCostBatch(action, prevAction, prevLogR, transCostParams, mRatio)
+
+
+    def calcTransCostNoBatch(action, prevAction, prevLogR, transCostParams, mRatio):
+        c = transCostParams['c']
+        c0 = transCostParams['c0']
+        priceRatio = tf.exp(prevLogR)
+        changes = tf.abs(action[:-1] - mRatio * tf.multiply(priceRatio, prevAction[:-1]))
+        transactionCost = tf.reduce_sum( tf.multiply(c, changes) )
+        transactionCost += c0
+        return transactionCost
+
+
+    def calcTransCostBatch(action, prevAction, prevLogR, transCostParams, mRatio):
+        c = transCostParams['c']
+        c0 = transCostParams['c0']
+        priceRatio = tf.exp(prevLogR)
+        changes = tf.abs(action[:,:-1] - mRatio * tf.multiply(priceRatio, prevAction[:,:-1]))
+        transactionCost = tf.reduce_sum( tf.multiply(c, changes) , axis = 1)
+        transactionCost += c0
+        return tf.reduce_sum(transactionCost)
+
+
+    def combineList(tensorList, weights):
+        t = tensorList[0] * weights[0]
+        for i in range(1, len(tensorList)):
+            t += tensorList[i] * weights[i]
+        return t
+
+
+# assume the input is of shape [D, 1]
+# add one more 0 to it (output shape [D+1, 1])
+    def addBias(x):
+        x = tf.concat([x, tf.constant(np.array([[0.0]]), dtype = tf.float32)], axis = 0)
+        return x
+
+
+# model-manager as mu for train class
+
+# In[441]:
+
+
+class mu:
+
+
+
+    def calcProfit(action, returns, inBatch = False):
+        if not inBatch:
+            return mu.calcProfitNoBatch(action, returns)
+        else:
+            return mu.calcProfitBatch(action, returns)
+
+    def calcProfitNoBatch(action, returns):
+        profit = tf.reduce_sum(tf.multiply(action[:-1], returns))
+        return profit
+
+    def calcProfitBatch(action, returns):
+        profit = tf.reduce_sum(tf.multiply(action[:,:-1], returns), axis = 1)
+        return tf.reduce_sum(profit)
+
+
+# multiply a batch of matrix a tensor in the shape of [D, N, L]
+# with a transformation matrix [L, transformSize]
+# output a tensor of shape [D, N, transformSize]
+    def batchMatMul(a, b, D):
+        out = []
+        print("batchMatMul", a.shape)
+        for i in range(D):
+            out.append(tf.matmul(a[i], b))
+        return tf.stack(out)
+
+    def train1epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, B = None):
+        return mu.trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess)
+
+    def test1epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, B = None):
+        return mu.trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, training = False)
+
+
+    def trainOrTest1Epoch(returnTensor, prevReturnMatrix, nextReturnMatrix, curModel, sess, training=True):
+        totalIters = returnTensor.shape[0]
+        prevLoss = 0.0
+        D = len(prevReturnMatrix[0])
+        prevA = pf.getInitialAllocation(D)
+        allActions = []
+        allLosses = []
+
+        for t in range(totalIters-1):
+            mRatio = pf.loss2mRatio(prevLoss)
+            inputs = {
+                'X': returnTensor[t],
+                'prevReturn': prevReturnMatrix[t],
+                'nextReturn': nextReturnMatrix[t],
+                'prevA': prevA,
+                'mRatio': mRatio
+            }
+            if training:
+                curA, curLoss = curModel.train(inputs, sess)
+            else:
+                curA, curLoss = curModel.get_action(inputs, sess)
+            allActions.append(curA)
+            allLosses.append(curLoss)
+
+            prevLoss = curLoss
+            prevA = curA
+
+        totalLoss = sum(allLosses)
+#        growthRates = map(lambda x: 1 - x, allLosses)
+        growthRates = [1-i for i in allLosses]
+        return allActions, growthRates, totalLoss
+
+    def getDecayingWeights(tensorList):
+        l = len(tensorList)
+        cur = 1.0
+        out = [cur]
+        total = cur
+
+	# create list
+        for i in range(1, len(tensorList)):
+            cur = cur * np.exp(1.0)
+            out.append(cur)
+            total += cur
+
+	# normalize
+        out = [ele/total for ele in out]
+
+	# convert to tensor
+        out = [tf.constant(ele, dtype = tf.float32) for ele in out]
+        return out
+
+    def calcTransCost(action, prevAction, prevLogR, transCostParams, mRatio, inBatch = False):
+        if not inBatch:
+            return mm.calcTransCostNoBatch(action, prevAction, prevLogR, transCostParams, mRatio)
+        else:
+            return mm.calcTransCostBatch(action, prevAction, prevLogR, transCostParams, mRatio)
+
+
+    def calcTransCostNoBatch(action, prevAction, prevLogR, transCostParams, mRatio):
+        c = transCostParams['c']
+        c0 = transCostParams['c0']
+        priceRatio = tf.exp(prevLogR)
+        changes = tf.abs(action[:-1] - mRatio * tf.multiply(priceRatio, prevAction[:-1]))
+        transactionCost = tf.reduce_sum( tf.multiply(c, changes) )
+        transactionCost += c0
+        return transactionCost
+
+
+    def calcTransCostBatch(action, prevAction, prevLogR, transCostParams, mRatio):
+        c = transCostParams['c']
+        c0 = transCostParams['c0']
+        priceRatio = tf.exp(prevLogR)
+        changes = tf.abs(action[:,:-1] - mRatio * tf.multiply(priceRatio, prevAction[:,:-1]))
+        transactionCost = tf.reduce_sum( tf.multiply(c, changes) , axis = 1)
+        transactionCost += c0
+        return tf.reduce_sum(transactionCost)
+
+
+    def combineList(tensorList, weights):
+        t = tensorList[0] * weights[0]
+        for i in range(1, len(tensorList)):
+            t += tensorList[i] * weights[i]
+        return t
+
+
+# assume the input is of shape [D, 1]
+# add one more 0 to it (output shape [D+1, 1])
+    def addBias(x):
+        x = tf.concat([x, tf.constant(np.array([[0.0]]), dtype = tf.float32)], axis = 0)
+        return x
+
+
+# For rnnModel : base_model
+
+# In[364]:
+
+
+#from sampleModel import Model, raiseNotDefined
+#import tensorflow as tf
+#import model_manager as mm
+#import json
+
+class Config:
+	lr = 1e-4
+	dropout = 1.0
+	modelType = 'Basic'
+
+class BaseModel(Model):
+
+    # object constructor
+    # D : the dimension of the portfolio,
+    # N : the number of days looking back
+    def __init__(self, D, N,transCostParams, L=1):
+        self.D = D
+        self.N = N
+        self.L = L
+        self.config = Config
+        self.transCostParams = {
+            key: tf.constant(transCostParams[key], dtype=tf.float32) for key in transCostParams
+            }
+        self.build()
+
+    # define the placeholders (add it to self.placeholders)
+    # X: whatever input it may be
+    # prevA: previous action (allocation)
+    # prevReturn: S_t / S_t-1
+    # nextReturn: S_t+1 / S_t
+    # mRatio: M_t-1 / M_t
+    def add_placeholders(self):
+
+        xShape = (self.D, self.N, self.L)
+        prShape = (self.D, 1)
+        nrShape = (self.D, 1)
+        paShape = (self.D + 1, 1)
+
+        allShapes = [xShape, prShape, nrShape, paShape]
+
+        self.placeholders = {
+            'X': tf.placeholder(dtype=tf.float32, shape=allShapes[0]),
+            'prevReturn': tf.placeholder(dtype=tf.float32, shape=allShapes[1]),
+            'nextReturn': tf.placeholder(dtype=tf.float32, shape=allShapes[2]),
+            'prevA': tf.placeholder(dtype=tf.float32, shape=allShapes[3]),
+            'mRatio': tf.placeholder(dtype=tf.float32, shape=()),
+        }
+
+    # create feed dict (return it)
+    def create_feed_dict(self, inputs):
+        feed_dict = {
+            self.placeholders[key]: inputs[key] for key in inputs
+            }
+        return feed_dict
+
+    # add an action (add to self)
+    def add_action(self):
+        # each model must implement this method
+        raiseNotDefined()
+
+    # create loss from action (return it)
+    def add_loss(self, action):
+        # calculate profit from action
+        prevReturn = self.placeholders['prevReturn']
+        nextReturn = self.placeholders['nextReturn']
+        mRatio = self.placeholders['mRatio']
+        prevA = self.placeholders['prevA']
+
+        transCostParams = self.transCostParams
+
+        # calculate return (hence loss)
+        profit = mm.calcProfit(action, nextReturn)
+        transCost = mm.calcTransCost(action, prevA, prevReturn, transCostParams, mRatio)
+        R = profit - transCost
+        loss = R * (-1.0)
+        return loss
+
+    # define how to train from loss (return it)
+    def add_train_op(self, loss):
+        optimizer = tf.train.AdamOptimizer(self.config.lr)
+        train_op = optimizer.minimize(loss)
+        return train_op
+
+    # train the model with 1 iteration
+    # return action and loss
+    def train(self, inputs, sess):
+        feed_dict = self.create_feed_dict(inputs)
+        action = sess.run(self.action, feed_dict=feed_dict)
+        loss, _ = sess.run([self.loss, self.train_op], feed_dict=feed_dict)
+        return action, loss
+
+    # get the action of the next time step
+    # return action and loss
+    def get_action(self, inputs, sess):
+        feed_dict = self.create_feed_dict(inputs)
+        action, loss = sess.run([self.action, self.loss], feed_dict=feed_dict)
+        return action, loss
+
+    def get_model_info(self):
+        model_info = {
+            'lr': self.config.lr,
+            'dropout': self.config.dropout,
+            'model_type': self.config.modelType
+        }
+        print("model info")
+        print(json.dumps(model_info))
+        print()
+
+
+# For rnnModel : rnncell
+
+# In[365]:
+
+
+import tensorflow as tf
+
+class RNNCell(tf.nn.rnn_cell.RNNCell):
+    def __init__(self, input_size, state_size):
+        self.input_size = input_size
+        self._state_size = state_size
+
+    @property
+    def state_size(self):
+        return self._state_size
+
+    @property
+    def output_size(self):
+        return self._state_size
+
+    def __call__(self, inputs, state, hiddenstate, scope=None):
+        scope = scope or type(self).__name__
+
+        initializer = tf.contrib.layers.xavier_initializer()
+        with tf.variable_scope(scope):
+            W_h = tf.get_variable('W_h',
+                                  [self.state_size, self.state_size],
+                                  initializer=initializer)
+            W_x = tf.get_variable('W_x',
+                                  [self.input_size, self.state_size],
+                                  initializer=initializer)
+            b1 = tf.get_variable('b',
+                                 [self.state_size, ],
+                                 initializer=initializer)
+
+            new_state = tf.nn.sigmoid(tf.matmul(state, W_h) + tf.matmul(inputs, W_x) + b1)
+
+        new_hiddenstate = hiddenstate
+        return new_state, new_hiddenstate
+
+
+# Rnnmodel
+
+# In[366]:
+
+
+#from base_model import BaseModel
+#import tensorflow as tf
+#import json
+#import model_manager as mm
+#from rnnCell import RNNCell
+
+
+class Config:
+    lr = 1e-3
+    dropout = 0.5
+    modelType = 'RNNModel'
+    cellType = 'rnn'
+    hiddenSize = 10
+    transformSize = 8
+    magnification1 = 500
+    magnification2 = 5
+
+
+class RnnModel(BaseModel):
+
+    # object constructor
+    # M : the dimension of the portfolio,
+    # N : the number of days looking back
+    # L : the number of data points per time step
+    def __init__(self, M, N, transCostParams, L=1, hiddenSize=Config.hiddenSize):
+        self.D = M
+        self.N = N
+        self.L = L
+        self.config = Config
+        self.transCostParams = {
+            key: tf.constant(transCostParams[key], dtype=tf.float32) for key in transCostParams
+            }
+        self.config.hiddenSize = hiddenSize
+
+        self.build()
+
+
+    # add an action (add to self and return it)
+    def add_action(self):
+        # define your variables here
+        X = tf.constant(self.config.magnification1, dtype=tf.float32) * self.placeholders['X']
+        prevReturn = self.placeholders['prevReturn']
+        prevA = self.placeholders['prevA']
+
+        cellType = self.config.cellType
+        cellSize = self.config.hiddenSize
+        inputSize = self.config.transformSize
+
+        if cellType == 'rnn':
+            cell = RNNCell(inputSize, cellSize)
+        # elif cellType == 'gru':
+        #     cell = GRUCell(inputSize, cellSize)
+        # elif cellType == 'lstm':
+        #     cell = LSTMCell(inputSize, cellSize)
+        else:
+            assert False, "Cell type undefined"
+
+        h = tf.zeros([self.D, self.config.hiddenSize], dtype=tf.float32)
+        hh = tf.zeros([self.D, self.config.hiddenSize], dtype=tf.float32)
+
+        states = []
+        hiddenstates = []
+        initializer = tf.contrib.layers.xavier_initializer()
+
+        W_trans = tf.get_variable('W_trans',
+                                  [self.L, inputSize],
+                                  initializer=initializer)
+
+        X2 = tf.nn.tanh(mm.batchMatMul(X, W_trans, self.D))
+
+        with tf.variable_scope("RNN"):
+            for t in range(self.N):
+                if t >= 1:
+                    tf.get_variable_scope().reuse_variables()
+                h, hh = cell(X2[:, t, :], h, hh)
+                states.append(h)
+                hiddenstates.append(hh)
+        # calculate action based on all hidden states
+
+        W_fc1 = tf.get_variable('W_fc1',
+                                [self.config.hiddenSize, self.D],
+                                initializer=initializer)
+        b_fc1 = tf.get_variable('b_fc1',
+                                [self.D, ],
+                                initializer=initializer)
+
+        W_fc2 = tf.get_variable('W_fc2',
+                                [self.D, 1],
+                                initializer=initializer)
+        b_fc2 = tf.get_variable('b_fc2',
+                                [1, ],
+                                initializer=initializer)
+
+        # get weights
+        weights = mm.getDecayingWeights(states)
+        finalState = mm.combineList(states, weights)
+
+        y_fc1 = tf.nn.sigmoid(tf.matmul(finalState, W_fc1) + b_fc1)
+        y_fc2 = tf.nn.tanh(tf.matmul(y_fc1, W_fc2) + b_fc2)
+
+        action = mm.addBias(y_fc2)
+        action = tf.constant(self.config.magnification2, dtype=tf.float32) * action
+        # action = tf.exp(action)
+        action = tf.nn.softmax(action, axis=0)
+        print("add_action",action.shape)
+        self.action = action
+
+    def get_model_info(self):
+        model_info = {
+            'lr': self.config.lr,
+            'dropout': self.config.dropout,
+            'model_type': self.config.modelType,
+            'cell_type': self.config.cellType,
+            'hidden_size': self.config.hiddenSize,
+            'transform_size': self.config.transformSize,
+            'magnification1': self.config.magnification1,
+            'magnification2': self.config.magnification2
+        }
+        return json.dumps(model_info)
+
+
+# In[367]:
+
+
+resultsDirectory = 'results/{}'.format(str(time.time()))
+logger = pf.setupLogger(resultsDirectory)
+
+
+# In[368]:
+
+
+get_ipython().run_line_magic('load_ext', 'autoreload')
+
+
+# In[369]:
+
+
+get_ipython().run_line_magic('autoreload', '')
+
+
+# from market import coinmarket
+
+# In[370]:
+
+
+import requests
+import lxml.html as lh
+class coinmarket:
+
+    def get_all_coins():
+        url = 'https://coinmarketcap.com/all/views/all/'
+        response = requests.get(url)
+        doc = lh.fromstring(response.content)
+        tr_elements = doc.xpath('//tr')
+        col=[]
+        i=0
+
+        for t in tr_elements[0]:
+            i+=1
+            name=t.text_content()
+            col.append((name,[]))
+
+        for j in range(2,len(tr_elements)):
+            T=tr_elements[j]
+            i=0
+            for t in T.iterchildren():
+                data=t.text_content()
+                if i>0:
+                    try:
+                        data=int(data)
+                    except:
+                        pass
+                col[i][1].append(data)
+                i+=1        
+        Dict={title:column for (title,column) in col}
+        df=pd.DataFrame(Dict)
+        kir = {'Ticker': df["Symbol"].values , 'MarketCap' : df['Market Cap'].values}
+        sad = pd.DataFrame(kir)
+        sad.drop([0], inplace= True)
+        
+        return sad
+
+
+# In[371]:
+
+
+df_market_cap = coinmarket.get_all_coins()
+
+
+# In[372]:
+
+
+coins = df_market_cap['Ticker'].unique()
+
+
+# In[373]:
+
+
+polo = Poloniex()
+start_time = 1388534400     # 2014.01.01
+end_time = time.time()
+usdt_coins_historical_data = {}
+btc_coins_historical_data = {}
+
+coins_without_data = []
+
+for coin in coins:
+    try:
+        usdt_coins_historical_data[coin] = polo.returnChartData("USDT_{}".format(coin),86400, start_time, end_time)
+    except Exception:
+        try:
+            btc_coins_historical_data[coin] = polo.returnChartData("BTC_{}".format(coin),86400, start_time, end_time)
+        except Exception:
+            coins_without_data.append(coin)
+
+
+# from market import operations 
+
+# In[374]:
+
+
+df_usdt_coins_historical_data = {}
+for usdt_coin, usdt_coin_data in usdt_coins_historical_data.items():
+    df_usdt_coins_historical_data[usdt_coin] = pd.DataFrame(usdt_coin_data)
+    df_usdt_coins_historical_data[usdt_coin].date = df_usdt_coins_historical_data[usdt_coin].date.apply(
+        lambda x: datetime.datetime.fromtimestamp(x))
+    df_usdt_coins_historical_data[usdt_coin].set_index('date', inplace=True)
+    df_usdt_coins_historical_data[usdt_coin].drop(["quoteVolume"], axis=1, inplace=True)
+
+
+# In[375]:
+
+
+
+#import pandas as pd
+#import datetime
+#from coinmarket import get_all_coins
+class operations:
+    def transform_btc_to_usdt(btc_dict, usdt_dict, btc):
+        df_btc_coins_historical_data = {}
+
+
+        for btc_coin, btc_coin_data in btc_dict.items():
+            df_btc_coins_historical_data[btc_coin] = pd.DataFrame(btc_coin_data)
+            df_btc_coins_historical_data[btc_coin].date = df_btc_coins_historical_data[btc_coin].date.apply(
+                lambda x: datetime.datetime.fromtimestamp(x))
+            df_btc_coins_historical_data[btc_coin].set_index('date', inplace=True)
+            df_btc_coins_historical_data[btc_coin].drop(["quoteVolume"], axis=1, inplace=True)
+
+        #transform to usdt
+            df_usdt_coins_historical_data[btc_coin] = df_btc_coins_historical_data[btc_coin].multiply(btc, axis='columns',
+                                                                                                  fill_value=0)
+        return df_usdt_coins_historical_data
+
+
+    def get_max_shape(d):
+        max_shape = 0
+        for k in d:
+            if len(d[k]) > max_shape:
+                max_shape = len(d[k])
+                coin = k
+        return max_shape, coin
+
+    def get_k_top_traded_coins(history, data,k):
+        traded_coins = []
+        for coin in data:
+            if len(data[coin][data[coin].close != 0]) > history:
+                traded_coins.append(coin)
+        return df_market_cap[df_market_cap.Ticker.isin(traded_coins)].head(k).Ticker.values
+
+
+# In[376]:
+
+
+df_usdt_coins_historical_data = operations.transform_btc_to_usdt(btc_coins_historical_data,usdt_coins_historical_data, df_usdt_coins_historical_data['BTC'])
+
+
+# In[377]:
+
+
+df_usdt_coins_historical_data['XMR'].head()
+
+
+# In[378]:
+
+
+TRAIN_WINDOW = 730
+VALID_WINDOW = 30
+TEST_WINDOW = 90
+
+
+# In[379]:
+
+
+coins_8_list = operations.get_k_top_traded_coins(TRAIN_WINDOW+TEST_WINDOW, df_usdt_coins_historical_data, 8)
+print(coins_8_list)
+
+
+# In[380]:
+
+
+for coin in coins_8_list:
+    data_path = "./data/{}.csv".format(coin)
+    df_usdt_coins_historical_data[coin].to_csv(data_path)
+
+
+# In[381]:
+
+
+df_usdt_coins_train_data = {}
+df_usdt_coins_test_data = {}
+
+for coin in coins_8_list:
+    df_usdt_coins_train_data[coin] = df_usdt_coins_historical_data[coin][-(TRAIN_WINDOW+TEST_WINDOW):-TEST_WINDOW]
+    df_usdt_coins_test_data[coin] = df_usdt_coins_historical_data[coin][-TEST_WINDOW:]
+
+
+# In[382]:
+
+
+get_ipython().run_line_magic('autoreload', '')
+
+
+# from market.portfolio_data import returns_data_frame, pf_correlation
+
+# In[383]:
+
+
+#import pandas as pd
+#import numpy as np
+#import matplotlib.pyplot as plt
+#import seaborn as sns
+def getList(kos): 
+    return list(kos.keys()) 
+
+def returns_data_frame(historical_data, return_type = "close_rate"):
+
+
+    coins = getList(historical_data)
+    df = pd.DataFrame(index=historical_data[coins[0]].index, columns=[coins])
+    k = 0 
+    for token in coins:
+        if return_type == "close_rate":
+            df.iloc[:,k] = historical_data[token]. close /historical_data[token].close.shift(1) - 1
+            k+=1
+        if return_type == "log":
+            df.iloc[:,k] = np.log(historical_data[token].close).diff()
+            k+=1
+        if return_type == "open_close_rate":
+            df.iloc[:,k] = historical_data[token]. close /historical_data[token].open
+            k+=1
+
+    df.fillna(0, inplace=True)
+    return df[1:]
+
+def pf_correlation(historical_data, return_type = "close_rate", size_tuple = (20,20), dir_to_save = None):
+    returns = returns_data_frame(historical_data, return_type = "close_rate")
+    corr = returns.corr()
+    mask = np.zeros_like(corr, dtype=np.bool)
+    mask[np.triu_indices_from(mask)] = True
+    f, ax = plt.subplots(figsize=size_tuple)
+
+    sns_plot = sns.heatmap(corr, mask=mask, vmax=1, center=0, annot=True, fmt='.1f',
+                           square=True, linewidths=.5, cbar_kws={"shrink": .5});
+
+    fig = sns_plot.get_figure()
+    if dir_to_save is not None:
+        fig.savefig(dir_to_save + '/full_figure.png')
+
+    return corr
+
+
+# In[384]:
+
+
+df_returns_train = returns_data_frame(df_usdt_coins_train_data, "log")
+
+
+# In[385]:
+
+
+pf_correlation(df_usdt_coins_train_data, "log", (30,30))
+
+
+# RNN model
+
+# In[386]:
+
+
+M = len(coins_8_list)
+W = TRAIN_WINDOW + TEST_WINDOW
+L = len(df_usdt_coins_historical_data["BTC"].drop(["weightedAverage"], axis = 1).columns)
+c = 0.0001
+epochs = 100
+transCostParams = {
+    'c': np.array([ [c] for _ in range(M) ]),
+    'c0': c
+}
+
+N = 15
+Hs = 5
+tol = 1e-7
+Hs_arr = [5, 7, 10, 12, 15]
+Ns_arr = [5, 7, 10, 12, 15]
+
+print(M,W,L)
+
+
+# In[387]:
+
+
+inputs = np.array([df_usdt_coins_historical_data[key][-W:].drop(["weightedAverage"], axis = 1).values for key in coins_8_list])
+print(inputs.shape)
+inputs = np.swapaxes(inputs,0,1)
+print(inputs.shape)
+
+
+# In[388]:
+
+
+returnTensor, prevReturnMatrix, nextReturnMatrix = pf.getInputs(inputs, N)
+
+
+# In[389]:
+
+
+returnTensor.shape
+
+
+# In[390]:
+
+
+prevReturnMatrix.shape
+
+
+# In[391]:
+
+
+nextReturnMatrix.shape
+
+
+# In[442]:
+
+
+def Train(Hs,N,logger):
+ 
+    
+    TrainIndex = range(0,TRAIN_WINDOW)
+    ValidationIndex = range(TRAIN_WINDOW,TRAIN_WINDOW+VALID_WINDOW)
+    TestIndex = range(TRAIN_WINDOW,W-N-1)
+
+    ## get training data
+    returnTensor_Train = np.array([returnTensor[_] for _ in TrainIndex])
+    prevReturnMatrix_Train = np.array([prevReturnMatrix[_] for _ in TrainIndex])
+    nextReturnMatrix_Train = np.array([nextReturnMatrix[_] for _ in TrainIndex])
+
+    ## get validation data
+    returnTensor_Valid = np.array([returnTensor[_] for _ in ValidationIndex])
+    prevReturnMatrix_Valid = np.array([prevReturnMatrix[_] for _ in ValidationIndex])
+    nextReturnMatrix_Valid = np.array([nextReturnMatrix[_] for _ in ValidationIndex])
+
+    ## get testing data
+    returnTensor_Test = np.array([returnTensor[_] for _ in TestIndex])
+    prevReturnMatrix_Test = np.array([prevReturnMatrix[_] for _ in TestIndex])
+    nextReturnMatrix_Test = np.array([nextReturnMatrix[_] for _ in TestIndex])  
+    
+    curModel = RnnModel(M, N, transCostParams, L = L, hiddenSize = Hs)
+    
+    model_info = curModel.get_model_info()
+    logger.info('model basic config')
+    logger.info(model_info)
+    
+    tol = 1e-7
+    with tf.Session() as sess:
+            sess.run(tf.global_variables_initializer())
+            ## train model
+            
+            preTotalGR = 0
+            for e in range(epochs):
+                logger.info('Beginning '+str(e)+'_th epoch')
+                logger.info('')
+
+                allActions, growthRates,totalLoss1 = mu.train1epoch(returnTensor_Train, prevReturnMatrix_Train, nextReturnMatrix_Train, curModel, sess)
+                print('totalLoss1', totalLoss1)
+                totalGR = pf.prod(growthRates)
+                print('totalGR', totalGR)
+                #print("Train",np.array(allActions).shape)
+                print("Her")
+                logger.info('model total growth rate in training data: '+ str(totalGR))
+                logger.info('')
+
+                if np.abs(preTotalGR - totalGR) < tol:
+                    break
+                else:
+                    preTotalGR = totalGR
+
+            ## valid model
+            allActions, growthRates, totalLoss2 = mu.test1epoch(returnTensor_Valid, prevReturnMatrix_Valid, nextReturnMatrix_Valid, curModel, sess)
+            devGrowthRates = growthRates
+            print('totalLoss2', totalLoss2)
+            logger.info('dev growth rate: '+ str(pf.prod(growthRates)))
+            
+            allActions, growthRates, totalLoss3 = mu.test1epoch(returnTensor_Test, prevReturnMatrix_Test, nextReturnMatrix_Test, curModel, sess)
+            print('totalLoss3', totalLoss3)
+            testGrowthRates = growthRates
+            logger.info('test growth rate: '+ str(pf.prod(growthRates)))
+            print(pf.prod(growthRates))
+            #growthRates = growthRates[-len(baselineGrowthRates):]
+    return devGrowthRates, testGrowthRates
+
+
+# In[443]:
+
+
+tf.reset_default_graph()
+
+
+# In[444]:
+
+
+devGR, testGR = Train(Hs,N,logger)
+
+
+# from backtesting import metrics
+
+# In[454]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def maximum_draw_down(ret):
+    i = np.argmax(np.maximum.accumulate(ret) - ret) # end of the period
+    j = np.argmax(ret[:i])
+    max_dd = ret[j] - ret[i]
+    return (max_dd, i,j)
+
+def portfolio_metrics(test_returns, weights, name="Strategy_perfomance",plot=True, rebalanced = False,save_results_dir = None):
+    m = np.asmatrix(test_returns.mean())
+    C = np.asmatrix(test_returns.cov())
+    w = np.asmatrix(weights)
+    p_return = (test_returns*weights).sum(axis = 1)
+    p_mu, p_std = portfolio_annualised_performance(w, m, C)
+    sharpe_ratio = p_mu/p_std
+    apv = np.sum(p_return)
+    cum_p_return = np.cumsum(p_return)
+    max_dd,i,j = maximum_draw_down(cum_p_return)
+    if plot:
+        plot_portfolio_backtest(cum_p_return,i,j,name,save_results_dir)
+    if rebalanced:
+        return max_dd, i, j, apv, sharpe_ratio, cum_p_return, p_return
+    return max_dd, apv, sharpe_ratio
+
+def print_portfolio_perfomance(apv,sharpe_ratio,max_dd):
+    print("-"*80)
+    print("Return:", round(apv,2))
+    print("Sharpe Ratio:", round(sharpe_ratio,2))
+    print("Maximum Drawdown:", round(max_dd,2))
+    print("\n")
+
+def print_best_stock_performance(returns,best_stock,rebalance_period,t,apv,sr,max_dd):
+    print("-"*80)
+    print("Best Stock:", best_stock)
+    print("Period:", t/rebalance_period, returns.index[t - rebalance_period], returns.index[t])
+    print("Annualised Return:", round(apv,2))
+    print("Annualised Sharpe Ratio:", round(sr,2))
+    print("Maximum Drawdown on period:", round(max_dd,2))
+    print("\n")
+
+def plot_markowitz_portfolio(results_frame):
+    #Assert if no columns stdev or r or sharpe_ratio
+    sharpe_ratio_max_idx = results_frame.sharpe_ratio.idxmax()
+    r_max, sr_max = results_frame.loc[sharpe_ratio_max_idx][["r","stdev"]]
+
+    volatility_min_idx = results_frame.stdev.idxmin()
+    r_min, stdev_min = results_frame.loc[volatility_min_idx][["r","stdev"]]
+
+    plt.rcParams.update({'font.size': 18})
+    plt.figure(figsize=(15, 10))
+    plt.scatter(results_frame.stdev,
+                    results_frame.r,
+                    c=results_frame.sharpe_ratio,
+                    cmap='RdYlGn', marker='o', s=10, alpha=0.3)
+    plt.colorbar()
+    plt.scatter(sr_max,r_max, marker='*',color='b',s=500, label='Maximum Sharpe ratio')
+    plt.scatter(stdev_min,r_min, marker='*',color='r',s=500, label='Minimum Volatitlity')
+
+    plt.xlabel('Volatility')
+    plt.ylabel('Returns')
+    plt.legend(labelspacing=0.8)
+
+    scaling_parametr = 0.1
+    y_min = (1-scaling_parametr)*results_frame.r.min()
+    y_max = (1+scaling_parametr)*results_frame.r.max()
+
+    plt.ylim(y_min, y_max)
+
+def portfolio_annualised_performance(weights, mean_returns, cov_matrix):
+    ''' Portfolio perfomance '''
+    days = 365
+    # days = 1
+    returns = np.sum(weights * np.transpose(mean_returns)) * days
+    std = np.sqrt(np.dot(np.dot(weights, cov_matrix), np.transpose(weights))) * np.sqrt(days)
+
+    return returns, std
+
+def plot_portfolio_backtest(returns, i, j,name,save_results_dir=0):
+    plt.rcParams.update({'font.size': 18})
+    plt.figure(figsize=(20,10))
+    plt.title(name)
+    plt.xlabel('Date')
+    plt.ylabel('Accumulated Returns')
+    plt.plot(returns)
+    plt.axhline(y=0, color='g', linestyle='--')
+    plt.plot([i, j], [returns[i], returns[j]], 'o', color='Red', markersize=10)
+#    if save_results_dir is not None:
+#        plt.savefig(save_results_dir+'/{0}.png'.format(name))
+
+
+# In[455]:
+
+
+def rnn_results(testGR,name = "DPG-RNN Daily Accumulated Returns"):
+    df_rnn_return = pd.DataFrame(index = df_usdt_coins_test_data["BTC"].index[:(TEST_WINDOW-N-1)][1:], columns = ["Return","Acc_return"])
+    log_ret = np.log(testGR)
+    df_rnn_return["Return"] = log_ret
+    df_rnn_return["Acc_return"] = np.cumsum(log_ret)
+    sr = np.sqrt(365) * (np.mean(df_rnn_return.Return) / np.std(df_rnn_return.Return))
+    max_dd,i,j = maximum_draw_down(df_rnn_return.Acc_return)
+    apv = df_rnn_return["Acc_return"][-1]
+    plot_portfolio_backtest(df_rnn_return.Acc_return,i,j, name)
+    print_portfolio_perfomance(apv,sr,max_dd)
+
+
+# In[456]:
+
+
+rnn_results(testGR)
+
+
+# In[ ]:
+
+
+
+
